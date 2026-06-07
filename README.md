@@ -12,10 +12,7 @@ Backend API for the AI Chat application built with FastAPI, PostgreSQL, JWT Auth
 
 ### 1. Clone the Repository
 
-```bash
-git clone <repository-url>
-cd <repository-name>
-```
+Clone repo with ssh or https
 
 ### 2. Create a Virtual Environment
 
