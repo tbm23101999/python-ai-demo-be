@@ -1,5 +1,4 @@
 import asyncio
-import json
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 from fastapi.responses import StreamingResponse
@@ -16,6 +15,7 @@ from app.schemas.chat import (
     MessageResponse,
     SendMessageRequest,
     SendMessageResponse,
+    SendMessageStreamResponse,
     SendOrCreateMessageRequest,
 )
 from app.services.ai_service import AIService, AIServiceError
@@ -63,43 +63,14 @@ def _list_chat_sessions(
     return [to_session_summary(session) for session in sessions]
 
 
-def _stream_message_chunks(
-    db: Session,
-    current_user: User,
-    message: str,
-    chat_id: str | None,
-):
-    is_new_chat = chat_id is None
-
-    try:
-        for chunk in _chat_service.send_or_create_message_stream(
-            db,
-            current_user,
-            message,
-            chat_id,
-        ):
-            if isinstance(chunk, tuple) and chunk[0] == "session":
-                if is_new_chat:
-                    session = chunk[1]
-                    payload = json.dumps(
-                        {
-                            "session": {
-                                "id": session.id,
-                                "title": session.title,
-                                "created_at": session.created_at.isoformat(),
-                            }
-                        }
-                    )
-                    yield f"\n__SESSION__{payload}__".encode("utf-8")
-                continue
-
-            yield chunk.encode("utf-8")
-    except ValueError as exc:
-        payload = json.dumps({"error": str(exc)})
-        yield f"[ERROR] {payload}".encode("utf-8")
-    except AIServiceError as exc:
-        payload = json.dumps({"error": exc.message})
-        yield f"[ERROR] {payload}".encode("utf-8")
+def _to_stream_response(
+    answer: str,
+    session,
+) -> SendMessageStreamResponse:
+    return SendMessageStreamResponse(
+        ai_response=answer,
+        session=to_session_summary(session),
+    )
 
 
 @router.get("", response_model=list[ChatSessionSummary])
@@ -146,26 +117,29 @@ async def send_or_create_message(
     )
 
 
-@router.post("/messages/stream")
+@router.post("/messages/stream", response_model=SendMessageStreamResponse)
 async def send_or_create_message_stream(
     request: SendOrCreateMessageRequest,
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    headers = {}
-    if request.chat_id:
-        headers["X-Chat-Session-Id"] = request.chat_id
-
-    return StreamingResponse(
-        _stream_message_chunks(
+    try:
+        session, answer = await asyncio.to_thread(
+            _chat_service.send_or_create_message,
             db,
             current_user,
             request.message,
             request.chat_id,
-        ),
-        media_type="text/plain; charset=utf-8",
-        headers=headers,
-    )
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except AIServiceError as exc:
+        raise HTTPException(
+            status_code=exc.status_code,
+            detail=exc.message,
+        ) from exc
+
+    return _to_stream_response(answer, session)
 
 
 @router.post(
@@ -280,20 +254,27 @@ async def send_chat_message(
     )
 
 
-@router.post("/{chat_id}/messages/stream")
+@router.post("/{chat_id}/messages/stream", response_model=SendMessageStreamResponse)
 async def send_chat_message_stream(
     chat_id: str,
     request: SendMessageRequest,
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    return StreamingResponse(
-        _stream_message_chunks(
+    try:
+        session, answer = await asyncio.to_thread(
+            _chat_service.send_message,
             db,
             current_user,
-            request.message,
             chat_id,
-        ),
-        media_type="text/plain; charset=utf-8",
-        headers={"X-Chat-Session-Id": chat_id},
-    )
+            request.message,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except AIServiceError as exc:
+        raise HTTPException(
+            status_code=exc.status_code,
+            detail=exc.message,
+        ) from exc
+
+    return _to_stream_response(answer, session)
